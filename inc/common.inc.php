@@ -846,7 +846,8 @@ function hesk_cleanID($field='track', $in=false)
         return false;
     }
 
-    return substr( preg_replace('/[^A-Z0-9\-]/','',strtoupper($id)) , 0, 12);
+    // Clean the ID - accept only A-Z, 0-9 and -
+    return substr( preg_replace('/[^A-Z0-9\-]/','',strtoupper($id)) , 0, 20);
 
 } // END hesk_cleanID()
 
@@ -857,128 +858,253 @@ function hesk_createID()
 
 	/*** Generate tracking ID and make sure it's not a duplicate one ***/
 
-	/* Ticket ID can be of these chars */
-	$useChars = 'AEUYBDGHJLMNPQRSTVWXZ123456789';
+	/* Get category ID from various possible sources */
+	$category_id = 1; // Default to 1 if nothing else is found
+	
+	// First check the form submission
+	if (isset($_POST['category'])) {
+		$category_id = intval($_POST['category']);
+	}
+	// Then check the session
+	elseif (isset($_SESSION['category'])) {
+		$category_id = intval($_SESSION['category']);
+	}
+	// Finally check GET parameters
+	elseif (isset($_GET['catid'])) {
+		$category_id = intval($_GET['catid']);
+	}
+	
+	/* Get category name and next sequence number */
+	$res = hesk_dbQuery("SELECT `id`, `name`, `code`, `next_seq` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` WHERE `id`='".intval($category_id)."' LIMIT 1");
+	
+	if (hesk_dbNumRows($res) != 1)
+	{
+		/* Category not found, use default category (should be 1) */
+		$res = hesk_dbQuery("SELECT `id`, `name`, `code`, `next_seq` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` ORDER BY `id` ASC LIMIT 1");
+		
+		if (hesk_dbNumRows($res) != 1)
+		{
+			/* No categories exist? Use a fallback method */
+			return hesk_createID_fallback();
+		}
+	}
+	
+	$category = hesk_dbFetchAssoc($res);
+	
+	/* If code is not set, generate it from the category name */
+	if (empty($category['code']))
+	{
+		$name = trim($category['name']);
+		
+		// For "Microsoft Office 365", we want "MOF" not "MIC" or "OFF"
+		// Split by spaces and take first letters of first three words
+		$words = preg_split('/\s+/', $name);
+		$code = '';
+		
+		// If we have multiple words, try to use first letter of each word (up to 3)
+		if (count($words) >= 3) {
+			$code = strtoupper(substr($words[0], 0, 1) . substr($words[1], 0, 1) . substr($words[2], 0, 1));
+		}
+		// If we have 2 words, use first letter of first word and first 2 letters of second word
+		elseif (count($words) == 2) {
+			$code = strtoupper(substr($words[0], 0, 1) . substr($words[1], 0, 2));
+		}
+		// Otherwise just use first 3 letters of the name
+		else {
+			$code = strtoupper(substr(preg_replace('/[^a-zA-Z0-9]/', '', $name), 0, 3));
+		}
+		
+		/* If code is empty or less than 3 chars, pad it or use "GEN" */
+		if (empty($code)) {
+			$code = 'GEN';
+		} elseif (strlen($code) == 1) {
+			$code .= 'EN';
+		} elseif (strlen($code) == 2) {
+			$code .= 'N';
+		}
+		
+		/* Update the category with the generated code */
+		hesk_dbQuery("UPDATE `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` SET `code`='".hesk_dbEscape($code)."' WHERE `id`='".intval($category['id'])."'");
+		
+		/* Store the code in the category array */
+		$category['code'] = $code;
+	}
+	
+	/* If next_seq is not set, initialize it to 1 */
+	if (empty($category['next_seq']))
+	{
+		$category['next_seq'] = 1;
+		
+		/* Update the category with the initial sequence number */
+		hesk_dbQuery("UPDATE `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` SET `next_seq`=1 WHERE `id`='".intval($category['id'])."'");
+	}
+	
+	/* Format sequence number to 6 digits */
+	$sequence_str = str_pad($category['next_seq'], 6, '0', STR_PAD_LEFT);
+	
+	/* Set tracking ID to category code + sequence number */
+	$trackingID = $category['code'] . '-' . $sequence_str;
 
-    /* Set tracking ID to an empty string */
-	$trackingID = '';
+	/* Check for duplicate IDs */
+	$res = hesk_dbQuery("SELECT `id` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `trackid` = '".hesk_dbEscape($trackingID)."' LIMIT 1");
 
-	/* Let's avoid duplicate ticket ID's, try up to 3 times */
-	for ($i=1;$i<=3;$i++)
-    {
-	    /* Generate raw ID */
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
-	    $trackingID .= $useChars[mt_rand(0,29)];
+	if (hesk_dbNumRows($res) == 0)
+	{
+		/* Everything is OK, no duplicates found. Update the sequence number */
+		hesk_dbQuery("UPDATE `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` SET `next_seq`=`next_seq`+1 WHERE `id`='".intval($category['id'])."'");
+		
+		/* Return the tracking ID */
+		return $trackingID;
+	}
 
-		/* Format the ID to the correct shape and check wording */
-        $trackingID = hesk_formatID($trackingID);
+	/* A duplicate ID has been found! Try with the next sequence number */
+	$category['next_seq']++;
+	$sequence_str = str_pad($category['next_seq'], 6, '0', STR_PAD_LEFT);
+	
+	/* Reset tracking ID to category code + new sequence number */
+	$trackingID = $category['code'] . '-' . $sequence_str;
+	
+	/* Check for duplicate IDs again */
+	$res = hesk_dbQuery("SELECT `id` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `trackid` = '".hesk_dbEscape($trackingID)."' LIMIT 1");
+
+	if (hesk_dbNumRows($res) == 0)
+	{
+		/* Everything is OK, no duplicates found. Update the sequence number */
+		hesk_dbQuery("UPDATE `".hesk_dbEscape($hesk_settings['db_pfix'])."categories` SET `next_seq`=`next_seq`+1 WHERE `id`='".intval($category['id'])."'");
+		
+		/* Return the tracking ID */
+		return $trackingID;
+	}
+
+	/* If we're here, we had duplicate IDs twice. Fall back to the old method */
+	return hesk_createID_fallback();
+
+} // END hesk_createID()
+
+/* Fallback to the original ID generation method if the new one fails */
+function hesk_createID_fallback()
+{
+	global $hesk_settings, $hesklang, $hesk_error_buffer;
+
+	/* Use "GEN" as the category code for fallback */
+	$code = 'GEN';
+	
+	/* Generate a random sequence number between 1 and 999999 */
+	$sequence = mt_rand(1, 999999);
+	$sequence_str = str_pad($sequence, 6, '0', STR_PAD_LEFT);
+	
+	/* Set tracking ID */
+	$trackingID = $code . '-' . $sequence_str;
+
+	/* Check for duplicate IDs */
+	$res = hesk_dbQuery("SELECT `id` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `trackid` = '".hesk_dbEscape($trackingID)."' LIMIT 1");
+
+	if (hesk_dbNumRows($res) == 0)
+	{
+		/* Everything is OK, no duplicates found */
+		return $trackingID;
+	}
+
+	/* A duplicate ID has been found! Try with a different random number */
+	for ($i=1; $i<=3; $i++)
+	{
+		/* Generate a new random sequence number */
+		$sequence = mt_rand(1, 999999);
+		$sequence_str = str_pad($sequence, 6, '0', STR_PAD_LEFT);
+		
+		/* Set tracking ID */
+		$trackingID = $code . '-' . $sequence_str;
 
 		/* Check for duplicate IDs */
 		$res = hesk_dbQuery("SELECT `id` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `trackid` = '".hesk_dbEscape($trackingID)."' LIMIT 1");
 
 		if (hesk_dbNumRows($res) == 0)
 		{
-        	/* Everything is OK, no duplicates found */
+			/* Everything is OK, no duplicates found */
 			return $trackingID;
-        }
+		}
+	}
 
-        /* A duplicate ID has been found! Let's try again (up to 2 more) */
-        $trackingID = '';
-    }
+	/* If we're here, we had multiple duplicate IDs. Try with microtime as a last resort */
+	$trackingID = $code . '-' . substr(str_replace('.', '', microtime(true)), -6);
 
-    /* No valid tracking ID, try one more time with microtime() */
-	$trackingID  = $useChars[mt_rand(0,29)];
-	$trackingID .= $useChars[mt_rand(0,29)];
-	$trackingID .= $useChars[mt_rand(0,29)];
-	$trackingID .= $useChars[mt_rand(0,29)];
-	$trackingID .= $useChars[mt_rand(0,29)];
-	$trackingID .= substr(microtime(), -5);
-
-	/* Format the ID to the correct shape and check wording */
-	$trackingID = hesk_formatID($trackingID);
-
+	/* Check for duplicate IDs one last time */
 	$res = hesk_dbQuery("SELECT `id` FROM `".hesk_dbEscape($hesk_settings['db_pfix'])."tickets` WHERE `trackid` = '".hesk_dbEscape($trackingID)."' LIMIT 1");
 
 	/* All failed, must be a server-side problem... */
 	if (hesk_dbNumRows($res) == 0)
 	{
 		return $trackingID;
-    }
+	}
 
-    $hesk_error_buffer['etid'] = $hesklang['e_tid'];
+	$hesk_error_buffer['etid'] = $hesklang['e_tid'];
 	return false;
-
-} // END hesk_createID()
+}
 
 
 function hesk_formatID($id)
 {
+	/* If the ID is less than 10 characters, it's using the old format */
+	if (strlen($id) < 10)
+	{
+		$useChars = 'AEUYBDGHJLMNPQRSTVWXZ123456789';
 
-	$useChars = 'AEUYBDGHJLMNPQRSTVWXZ123456789';
+		$replace  = $useChars[mt_rand(0,29)];
+		$replace .= mt_rand(1,9);
+		$replace .= $useChars[mt_rand(0,29)];
 
-    $replace  = $useChars[mt_rand(0,29)];
-    $replace .= mt_rand(1,9);
-    $replace .= $useChars[mt_rand(0,29)];
+		/*
+		Remove 3 letter bad words from ID
+		Possiblitiy: 1:27,000
+		*/
+		$remove = array(
+		'ASS',
+		'CUM',
+		'FAG',
+		'FUK',
+		'GAY',
+		'SEX',
+		'TIT',
+		'XXX',
+		);
 
-    /*
-    Remove 3 letter bad words from ID
-    Possiblitiy: 1:27,000
-    */
-	$remove = array(
-    'ASS',
-    'CUM',
-    'FAG',
-    'FUK',
-    'GAY',
-    'SEX',
-    'TIT',
-    'XXX',
-    );
+		$id = str_replace($remove,$replace,$id);
 
-    $id = str_replace($remove,$replace,$id);
+		/*
+		Remove 4 letter bad words from ID
+		Possiblitiy: 1:810,000
+		*/
+		$remove = array(
+		'ANAL',
+		'ANUS',
+		'BUTT',
+		'CAWK',
+		'CLIT',
+		'COCK',
+		'CRAP',
+		'CUNT',
+		'DICK',
+		'DYKE',
+		'FART',
+		'FUCK',
+		'JAPS',
+		'JERK',
+		'JIZZ',
+		'KNOB',
+		'PISS',
+		'POOP',
+		'SHIT',
+		'SLUT',
+		'SUCK',
+		'TURD',
 
-    /*
-    Remove 4 letter bad words from ID
-    Possiblitiy: 1:810,000
-    */
-	$remove = array(
-	'ANAL',
-	'ANUS',
-	'BUTT',
-	'CAWK',
-	'CLIT',
-	'COCK',
-	'CRAP',
-	'CUNT',
-	'DICK',
-	'DYKE',
-	'FART',
-	'FUCK',
-	'JAPS',
-	'JERK',
-	'JIZZ',
-	'KNOB',
-	'PISS',
-	'POOP',
-	'SHIT',
-	'SLUT',
-	'SUCK',
-	'TURD',
+		// Also, remove words that are known to trigger mod_security
+		'WGET',
+		);
 
-    // Also, remove words that are known to trigger mod_security
-	'WGET',
-    );
-
-	$replace .= mt_rand(1,9);
-    $id = str_replace($remove,$replace,$id);
+		$replace .= mt_rand(1,9);
+		$id = str_replace($remove,$replace,$id);
+	}
 
     /* Format the ID string into XXX-XXX-XXXX format for easier readability */
     $id = $id[0].$id[1].$id[2].'-'.$id[3].$id[4].$id[5].'-'.$id[6].$id[7].$id[8].$id[9];
@@ -2203,7 +2329,7 @@ function hesk_makeURL($text, $class = '')
 
 	// matches a "www.xxxx.yyyy[/zzzz]" kinda lazy URL thing
 	$text = preg_replace_callback(
-		'#(^|[\n\t (>])(' . "www\.(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})+(?::\d*)?(?:/(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})*)*(?:\?(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@/?|]+|%[\dA-F]{2})*)?(?:\#(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@/?|]+|%[\dA-F]{2})*)?" . ')#iu',
+		'#(^|[\n\t (>])(' . "www\.(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})+(?::\d*)?(?:/(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})*)*(?:\?(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})*)?(?:\#(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})*)?(?:\#(?:[^\p{C}\p{Z}\p{S}\p{P}\p{Nl}\p{No}\p{Me}\x{1100}-\x{115F}\x{A960}-\x{A97C}\x{1160}-\x{11A7}\x{D7B0}-\x{D7C6}\x{20D0}-\x{20FF}\x{1D100}-\x{1D1FF}\x{1D200}-\x{1D24F}\x{0640}\x{07FA}\x{302E}\x{302F}\x{3031}-\x{3035}\x{303B}]*[\x{00B7}\x{0375}\x{05F3}\x{05F4}\x{30FB}\x{002D}\x{06FD}\x{06FE}\x{0F0B}\x{3007}\x{00DF}\x{03C2}\x{200C}\x{200D}\pL0-9\-._~!$&'(*+,;=:@|]+|%[\dA-F]{2})*)?" . ')#iu',
         function ($matches) use ($class) {
             return  make_clickable_callback(MAGIC_URL_WWW, $matches[1], $matches[2], '', $class);
         },
